@@ -245,7 +245,8 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   if (!(info.privacy_level_options || []).includes(privacy)) privacy = (info.privacy_level_options || ['SELF_ONLY'])[0];
   const postInfo = { title: String(title).slice(0,2200), privacy_level: privacy, disable_duet:!!ch.tk_disable_duet||!!info.duet_disabled, disable_stitch:!!ch.tk_disable_stitch||!!info.stitch_disabled, disable_comment:!!ch.tk_disable_comment||!!info.comment_disabled, brand_content_toggle:false, brand_organic_toggle:false };
   if (ch.tk_use_pull_from_url !== false && fileInfo.publicUrl) {
-    const tkVideoUrl = fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
+    // googleapis.com URL use করো (TikTok verified domain), না হলে drive URL convert করো
+    const tkVideoUrl = fileInfo.publicUrl.includes('googleapis.com') ? fileInfo.publicUrl : fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
     const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
     const d = await r.json();
     if (!d.error || d.error.code === 'ok') return d.data?.publish_id;
