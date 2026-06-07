@@ -341,7 +341,7 @@ async function uploadToTikTokCookies(ch, fileInfo, title) {
       brand_organic_toggle: false,
     };
 
-    const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', {
+    const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -438,7 +438,7 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   if (ch.tk_use_pull_from_url !== false && fileInfo.publicUrl) {
     // googleapis.com URL use করো (TikTok verified domain), না হলে drive URL convert করো
     const tkVideoUrl = fileInfo.publicUrl.includes('googleapis.com') ? fileInfo.publicUrl : fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
-    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
+    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
     const d = await r.json();
     if (!d.error || d.error.code === 'ok') return d.data?.publish_id;
     // Fallback to FILE_UPLOAD if PULL fails
@@ -452,7 +452,7 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
   const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
   const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
-  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
+  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
   const uploadUrl = initD.data?.upload_url;
