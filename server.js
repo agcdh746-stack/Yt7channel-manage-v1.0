@@ -255,19 +255,25 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
     if (!fileInfo.localPath) throw new Error('TikTok PULL failed এবং local file নেই: ' + JSON.stringify(d.error));
   }
   const stat = fs.statSync(fileInfo.localPath);
-  const MIN_CHUNK = 5 * 1024 * 1024;   // 5MB minimum
-  const MAX_CHUNK = 64 * 1024 * 1024;  // 64MB maximum
-  const chunkSize = Math.min(MAX_CHUNK, Math.max(MIN_CHUNK, stat.size));
-  const totalChunks = Math.ceil(stat.size / chunkSize);
-  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: chunkSize, total_chunk_count: totalChunks } }) });
+  // TikTok chunk rules: chunk_size 5MB-64MB, total_chunk_count >= 1
+  // For multi-chunk: each chunk must be 5MB-64MB except last chunk
+  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
+  const totalChunks = Math.max(1, Math.ceil(stat.size / CHUNK_SIZE));
+  const actualChunkSize = Math.ceil(stat.size / totalChunks);
+  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
-  // FIX BUG4: consistent error check
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
   const uploadUrl = initD.data?.upload_url;
   if (!uploadUrl) throw new Error('TikTok init: no upload_url');
-  const web = Readable.toWeb(fs.createReadStream(fileInfo.localPath));
-  const putR = await fetch(uploadUrl, { method:'PUT', headers:{ 'Content-Type':'video/mp4', 'Content-Range':`bytes 0-${stat.size-1}/${stat.size}` }, body: web, duplex:'half' });
-  if (!putR.ok) throw new Error('TikTok PUT failed: ' + await putR.text());
+  // Upload chunks
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * actualChunkSize;
+    const end = Math.min(start + actualChunkSize, stat.size);
+    const chunkStream = fs.createReadStream(fileInfo.localPath, { start, end: end - 1 });
+    const chunkWeb = Readable.toWeb(chunkStream);
+    const putR = await fetch(uploadUrl, { method:'PUT', headers:{ 'Content-Type':'video/mp4', 'Content-Range':`bytes ${start}-${end-1}/${stat.size}` }, body: chunkWeb, duplex:'half' });
+    if (!putR.ok) throw new Error('TikTok PUT chunk ' + i + ' failed: ' + await putR.text());
+  }
   return initD.data?.publish_id;
 }
 
