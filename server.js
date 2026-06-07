@@ -249,7 +249,28 @@ const TK_USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 ];
 
-function getTikTokHeaders(cookies) {
+// Parse Netscape format cookies to header string
+function parseNetscapeCookies(raw) {
+  if (!raw || !raw.trim()) return '';
+  // If already in key=value; format, return as is
+  if (!raw.includes('\t') && raw.includes('=')) return raw.trim();
+  // Parse Netscape tab-separated format
+  const pairs = [];
+  raw.split('\n').forEach(line => {
+    line = line.trim();
+    if (!line || line.startsWith('#')) return;
+    const parts = line.split('\t');
+    if (parts.length >= 7) {
+      const name = parts[5].trim();
+      const value = parts[6].trim();
+      if (name) pairs.push(`${name}=${value}`);
+    }
+  });
+  return pairs.join('; ');
+}
+
+function getTikTokHeaders(rawCookies) {
+  const cookieStr = parseNetscapeCookies(rawCookies);
   const ua = TK_USER_AGENTS[Math.floor(Math.random() * TK_USER_AGENTS.length)];
   const isMobile = ua.includes('Android') || ua.includes('iPhone');
   return {
@@ -265,7 +286,7 @@ function getTikTokHeaders(cookies) {
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'Cookie': cookies,
+    'Cookie': cookieStr,
   };
 }
 
