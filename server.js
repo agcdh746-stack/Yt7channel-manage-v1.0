@@ -245,14 +245,19 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   if (!(info.privacy_level_options || []).includes(privacy)) privacy = (info.privacy_level_options || ['SELF_ONLY'])[0];
   const postInfo = { title: String(title).slice(0,2200), privacy_level: privacy, disable_duet:!!ch.tk_disable_duet||!!info.duet_disabled, disable_stitch:!!ch.tk_disable_stitch||!!info.stitch_disabled, disable_comment:!!ch.tk_disable_comment||!!info.comment_disabled, brand_content_toggle:false, brand_organic_toggle:false };
   if (ch.tk_use_pull_from_url !== false && fileInfo.publicUrl) {
-    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: fileInfo.publicUrl } }) });
+    const tkVideoUrl = fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
+    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
     const d = await r.json();
-    // FIX BUG4: consistent error check
-    if (d.error && d.error.code !== 'ok') throw new Error('TikTok init (PULL): ' + JSON.stringify(d.error));
-    return d.data?.publish_id;
+    if (d.error && d.error.code === 'ok') return d.data?.publish_id;
+    // Fallback to FILE_UPLOAD if PULL fails
+    console.log('[TikTok] PULL_FROM_URL failed, falling back to FILE_UPLOAD:', d.error);
   }
   const stat = fs.statSync(fileInfo.localPath);
-  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: stat.size, total_chunk_count: 1 } }) });
+  const MIN_CHUNK = 5 * 1024 * 1024;   // 5MB minimum
+  const MAX_CHUNK = 64 * 1024 * 1024;  // 64MB maximum
+  const chunkSize = Math.min(MAX_CHUNK, Math.max(MIN_CHUNK, stat.size));
+  const totalChunks = Math.ceil(stat.size / chunkSize);
+  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: chunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
   // FIX BUG4: consistent error check
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
@@ -264,11 +269,19 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   return initD.data?.publish_id;
 }
 
+
+function driveDirectUrl(url) {
+  if (!url || !url.includes('drive.google.com')) return url;
+  const m = url.match(/drive\.google\.com\/file\/d\/([^\/]+)/);
+  if (m) return `https://drive.google.com/uc?export=download&confirm=1&id=${m[1]}`;
+  return url;
+}
+
 async function uploadToInstagram(ch, fileInfo, caption) {
   if (!ch.ig_user_id) throw new Error(`IG CH${ch.id}: ig_user_id নেই`);
   if (!ch.ig_access_token) throw new Error(`IG CH${ch.id}: access_token নেই`);
   if (!fileInfo.publicUrl) throw new Error(`IG CH${ch.id}: Drive public URL দরকার`);
-  const params = new URLSearchParams({ media_type:'REELS', video_url: fileInfo.publicUrl, caption: String(caption||'').slice(0,2200), share_to_feed: ch.ig_share_to_feed === false ? 'false':'true', access_token: ch.ig_access_token });
+  const params = new URLSearchParams({ media_type:'REELS', video_url: driveDirectUrl(fileInfo.publicUrl), caption: String(caption||'').slice(0,2200), share_to_feed: ch.ig_share_to_feed === false ? 'false':'true', access_token: ch.ig_access_token });
   const cR = await fetch(`https://graph.facebook.com/v22.0/${ch.ig_user_id}/media`, { method:'POST', body: params });
   const cD = await cR.json();
   if (!cD.id) throw new Error('IG create container failed: ' + JSON.stringify(cD));
@@ -292,7 +305,7 @@ async function uploadToFacebook(ch, fileInfo, title, description) {
   if (!ch.fb_page_id) throw new Error(`FB CH${ch.id}: page_id নেই`);
   if (!ch.fb_page_access_token) throw new Error(`FB CH${ch.id}: page access_token নেই`);
   if (!fileInfo.publicUrl) throw new Error(`FB CH${ch.id}: Drive public URL দরকার`);
-  const r = await fetch(`https://graph.facebook.com/v22.0/${ch.fb_page_id}/videos`, { method:'POST', body: new URLSearchParams({ file_url: fileInfo.publicUrl, title: String(title||'').slice(0,255), description: String(description||'').slice(0,5000), access_token: ch.fb_page_access_token }) });
+  const r = await fetch(`https://graph.facebook.com/v22.0/${ch.fb_page_id}/videos`, { method:'POST', body: new URLSearchParams({ file_url: driveDirectUrl(fileInfo.publicUrl), title: String(title||'').slice(0,255), description: String(description||'').slice(0,5000), access_token: ch.fb_page_access_token }) });
   const d = await r.json();
   if (!d.id) throw new Error('FB upload failed: ' + JSON.stringify(d));
   return d.id;
