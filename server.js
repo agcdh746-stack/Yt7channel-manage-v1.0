@@ -248,9 +248,10 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
     const tkVideoUrl = fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
     const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
     const d = await r.json();
-    if (d.error && d.error.code === 'ok') return d.data?.publish_id;
+    if (!d.error || d.error.code === 'ok') return d.data?.publish_id;
     // Fallback to FILE_UPLOAD if PULL fails
     console.log('[TikTok] PULL_FROM_URL failed, falling back to FILE_UPLOAD:', d.error);
+    if (!fileInfo.localPath) throw new Error('TikTok PULL failed এবং local file নেই: ' + JSON.stringify(d.error));
   }
   const stat = fs.statSync(fileInfo.localPath);
   const MIN_CHUNK = 5 * 1024 * 1024;   // 5MB minimum
