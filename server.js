@@ -58,7 +58,7 @@ function buildDefaultConfig() {
 function emptyChannel(platform, id) {
   const base = { id, platform, name: `${platform} #${id}`, drive_folder_id: '', enabled: false, schedule: [], titles: [], description: '', tags: '' };
   if (platform === 'youtube')   return { ...base, yt_refresh_token: '' };
-  if (platform === 'tiktok')    return { ...base, tk_access_token:'', tk_refresh_token:'', tk_open_id:'', tk_token_expires_at:0, tk_privacy:'', tk_use_pull_from_url:true, tk_disable_duet:false, tk_disable_stitch:false, tk_disable_comment:false };
+  if (platform === 'tiktok')    return { ...base, tk_access_token:'', tk_refresh_token:'', tk_open_id:'', tk_token_expires_at:0, tk_privacy:'', tk_use_pull_from_url:true, tk_disable_duet:false, tk_disable_stitch:false, tk_disable_comment:false, tk_cookies:'', tk_use_cookies:false };
   if (platform === 'instagram') return { ...base, ig_user_id:'', ig_access_token:'', ig_share_to_feed:true };
   if (platform === 'facebook')  return { ...base, fb_page_id:'', fb_page_access_token:'' };
   return base;
@@ -239,6 +239,110 @@ async function queryTikTokCreatorInfo(token) {
   if (d.error && d.error.code !== 'ok') throw new Error('TikTok creator_info: ' + (d.error.message || d.error.code || JSON.stringify(d.error)));
   return d.data || {};
 }
+
+// Realistic TikTok browser headers for bot detection evasion
+const TK_USER_AGENTS = [
+  'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+];
+
+function getTikTokHeaders(cookies) {
+  const ua = TK_USER_AGENTS[Math.floor(Math.random() * TK_USER_AGENTS.length)];
+  const isMobile = ua.includes('Android') || ua.includes('iPhone');
+  return {
+    'User-Agent': ua,
+    'Referer': 'https://www.tiktok.com/',
+    'Origin': 'https://www.tiktok.com',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'sec-ch-ua': '"Chromium";v="120", "Google Chrome";v="120"',
+    'sec-ch-ua-mobile': isMobile ? '?1' : '?0',
+    'sec-ch-ua-platform': isMobile ? '"Android"' : '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'Cookie': cookies,
+  };
+}
+
+async function uploadToTikTokCookies(ch, fileInfo, title) {
+  if (!ch.tk_cookies) throw new Error(`TikTok CH${ch.id}: cookies নেই`);
+  const cookies = ch.tk_cookies;
+  const headers = getTikTokHeaders(cookies);
+
+  // Random delay 1-3 seconds for human-like behavior
+  await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+
+  // Step 1: Get upload URL from TikTok web
+  const initHeaders = {
+    ...headers,
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+
+  // Download file from Drive first
+  let localPath = fileInfo.localPath;
+  if (!localPath) {
+    const tmpPath = `/tmp/tk_${ch.id}_${Date.now()}.mp4`;
+    const dlR = await fetch(fileInfo.publicUrl);
+    if (!dlR.ok) throw new Error('Drive download failed');
+    const buf = await dlR.arrayBuffer();
+    fs.writeFileSync(tmpPath, Buffer.from(buf));
+    localPath = tmpPath;
+  }
+
+  const stat = fs.statSync(localPath);
+  const CHUNK_SIZE = 10 * 1024 * 1024;
+  const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
+  const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
+
+  // Init upload via web API
+  const initBody = JSON.stringify({
+    upload_type: 'INIT',
+    video_size: stat.size,
+    chunk_size: actualChunkSize,
+    total_chunk_count: totalChunks,
+  });
+
+  const initR = await fetch('https://www.tiktok.com/api/upload/media/?aid=1988&lang=en', {
+    method: 'POST',
+    headers: { ...initHeaders, 'Content-Length': String(initBody.length) },
+    body: initBody,
+  });
+
+  const initD = await initR.json();
+  if (!initD.upload_url && !initD.data?.upload_url) throw new Error('TikTok cookies upload init failed: ' + JSON.stringify(initD));
+
+  const uploadUrl = initD.upload_url || initD.data?.upload_url;
+
+  // Upload chunks
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * actualChunkSize;
+    const end = Math.min(start + actualChunkSize, stat.size);
+    const chunk = fs.readFileSync(localPath).slice(start, end);
+    await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        ...headers,
+        'Content-Type': 'video/mp4',
+        'Content-Range': `bytes ${start}-${end-1}/${stat.size}`,
+        'Content-Length': String(end - start),
+      },
+      body: chunk,
+    });
+    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+  }
+
+  // Cleanup temp file
+  if (!fileInfo.localPath && fs.existsSync(localPath)) fs.unlinkSync(localPath);
+
+  return 'cookies_upload_done';
+}
+
 async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   const info = await queryTikTokCreatorInfo(token);
   let privacy = ch.tk_privacy || cfg.shared.tiktok_privacy || 'SELF_ONLY';
@@ -247,7 +351,7 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   if (ch.tk_use_pull_from_url !== false && fileInfo.publicUrl) {
     // googleapis.com URL use করো (TikTok verified domain), না হলে drive URL convert করো
     const tkVideoUrl = fileInfo.publicUrl.includes('googleapis.com') ? fileInfo.publicUrl : fileInfo.publicUrl.includes('drive.google.com') ? fileInfo.publicUrl.replace(/drive\.google\.com\/file\/d\/([^\/]+).*/, 'https://drive.google.com/uc?export=download&confirm=1&id=$1') : fileInfo.publicUrl;
-    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
+    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'PULL_FROM_URL', video_url: tkVideoUrl } }) });
     const d = await r.json();
     if (!d.error || d.error.code === 'ok') return d.data?.publish_id;
     // Fallback to FILE_UPLOAD if PULL fails
@@ -260,7 +364,7 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
   const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
   const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
   const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
-  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
+  const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
   const uploadUrl = initD.data?.upload_url;
@@ -371,8 +475,12 @@ async function processChannel(platform, ch) {
       resultId = await uploadToYouTube(tempPath, title.substring(0,100), description, tags, ytToken, cfg.shared.yt_privacy || 'public');
       resultUrl = `https://youtu.be/${resultId}`;
     } else if (platform === 'tiktok') {
-      const tkToken = await ensureTikTokToken(cfg, ch);
-      resultId = await uploadToTikTok(cfg, ch, fileInfo, title, tkToken);
+      if (ch.tk_use_cookies && ch.tk_cookies) {
+        resultId = await uploadToTikTokCookies(ch, fileInfo, title);
+      } else {
+        const tkToken = await ensureTikTokToken(cfg, ch);
+        resultId = await uploadToTikTok(cfg, ch, fileInfo, title, tkToken);
+      }
       resultUrl = `tiktok:publish_id=${resultId}`;
     } else if (platform === 'instagram') {
       const tagSuffix = tags.length ? '\n\n' + tags.map(t => '#' + String(t).replace(/[^a-zA-Z0-9_]/g, '')).join(' ') : '';
@@ -587,6 +695,27 @@ app.post('/api/device/poll/:chId', async (req, res) => {
     return res.json({ status:'ok', channel_name: ch.name });
   }
   res.status(400).json({ error:'Token পাওয়া যায়নি' });
+});
+
+
+// TikTok Cookies API
+app.post('/api/tiktok/:chId/cookies', async (req, res) => {
+  try {
+    const cfg = await loadConfig();
+    const chId = parseInt(req.params.chId);
+    const ch = findChannel(cfg, 'tiktok', chId);
+    if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    const cookies = (req.body.cookies || '').trim();
+    ch.tk_cookies = cookies;
+    ch.tk_use_cookies = !!cookies;
+    // Clear OAuth tokens if switching to cookies
+    if (cookies) {
+      ch.tk_access_token = '';
+      ch.tk_refresh_token = '';
+    }
+    await saveConfig(cfg);
+    res.json({ ok: true, connected: !!cookies });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/auth/tiktok/:chId/start', async (req, res) => {
