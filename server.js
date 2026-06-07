@@ -446,35 +446,39 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
     if (!fileInfo.localPath) throw new Error('TikTok PULL failed এবং local file নেই: ' + JSON.stringify(d.error));
   }
   const stat = fs.statSync(fileInfo.localPath);
-  // TikTok: total_chunk_count = floor(video_size / chunk_size), last chunk handles remainder
-  // chunk_size must be 5MB-64MB; videos <5MB use chunk_size=video_size, count=1
+  // TikTok spec: chunk_size 5MB-64MB, total_chunk_count = floor(video_size / chunk_size)
+  // last chunk size = video_size - (chunk_size * (total_chunk_count - 1)) — automatically handled
+  // videos <= chunk_size: chunk_size=video_size, count=1
   const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
-  const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.ceil(stat.size / CHUNK_SIZE);
+  const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
   const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
   const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
   const uploadUrl = initD.data?.upload_url;
   if (!uploadUrl) throw new Error('TikTok init: no upload_url');
-  // Upload chunks
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * actualChunkSize;
-    const end = Math.min(start + actualChunkSize, stat.size);
-    const chunkSize = end - start;
-    // Buffer এ পড়ো — stream করলে শেষ chunk এ null/crash হয়
-    const chunkBuf = Buffer.allocUnsafe(chunkSize);
-    const fd = fs.openSync(fileInfo.localPath, 'r');
-    fs.readSync(fd, chunkBuf, 0, chunkSize, start);
-    fs.closeSync(fd);
-    const putR = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'video/mp4', 'Content-Range': `bytes ${start}-${end-1}/${stat.size}`, 'Content-Length': String(chunkSize) },
-      body: chunkBuf,
-    });
-    if (!putR.ok) {
-      const errTxt = await putR.text().catch(() => String(putR.status));
-      throw new Error(`TikTok PUT chunk ${i} failed: ${putR.status} ${errTxt}`);
+  // Upload chunks — fd একবার খুলি, loop এ বারবার খুলি না
+  const fd = fs.openSync(fileInfo.localPath, 'r');
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * actualChunkSize;
+      // last chunk: ফাইলের শেষ পর্যন্ত সব নেয় (remainder)
+      const end = (i === totalChunks - 1) ? stat.size : start + actualChunkSize;
+      const chunkSize = end - start;
+      const chunkBuf = Buffer.allocUnsafe(chunkSize);
+      fs.readSync(fd, chunkBuf, 0, chunkSize, start);
+      const putR = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'video/mp4', 'Content-Range': `bytes ${start}-${end-1}/${stat.size}`, 'Content-Length': String(chunkSize) },
+        body: chunkBuf,
+      });
+      if (!putR.ok) {
+        const errTxt = await putR.text().catch(() => String(putR.status));
+        throw new Error(`TikTok PUT chunk ${i}/${totalChunks} failed: ${putR.status} ${errTxt}`);
+      }
     }
+  } finally {
+    fs.closeSync(fd);
   }
   return initD.data?.publish_id;
 }
