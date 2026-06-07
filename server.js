@@ -255,11 +255,11 @@ async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
     if (!fileInfo.localPath) throw new Error('TikTok PULL failed এবং local file নেই: ' + JSON.stringify(d.error));
   }
   const stat = fs.statSync(fileInfo.localPath);
-  // TikTok chunk rules: chunk_size 5MB-64MB, total_chunk_count >= 1
-  // For multi-chunk: each chunk must be 5MB-64MB except last chunk
-  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
-  const totalChunks = Math.max(1, Math.ceil(stat.size / CHUNK_SIZE));
-  const actualChunkSize = Math.ceil(stat.size / totalChunks);
+  // TikTok: total_chunk_count = floor(video_size / chunk_size), last chunk handles remainder
+  // chunk_size must be 5MB-64MB; videos <5MB use chunk_size=video_size, count=1
+  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+  const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
+  const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
   const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify({ post_info: postInfo, source_info: { source:'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks } }) });
   const initD = await initR.json();
   if (initD.error && initD.error.code !== 'ok') throw new Error('TikTok init (FILE): ' + JSON.stringify(initD.error));
