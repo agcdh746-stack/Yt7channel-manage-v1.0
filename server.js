@@ -290,78 +290,144 @@ function getTikTokHeaders(rawCookies) {
   };
 }
 
+// cookies string থেকে specific cookie value বের করো
+function extractCookieValue(rawCookies, name) {
+  const cookieStr = parseNetscapeCookies(rawCookies);
+  const match = cookieStr.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+  return match ? decodeURIComponent(match[1].trim()) : null;
+}
+
 async function uploadToTikTokCookies(ch, fileInfo, title) {
   if (!ch.tk_cookies) throw new Error(`TikTok CH${ch.id}: cookies নেই`);
-  const cookies = ch.tk_cookies;
-  const headers = getTikTokHeaders(cookies);
 
-  // Random delay 1-3 seconds for human-like behavior
-  await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+  // sessionid extract করো — এটাই TikTok এর main auth cookie
+  const sessionid = extractCookieValue(ch.tk_cookies, 'sessionid') || extractCookieValue(ch.tk_cookies, 'sid_tt');
+  if (!sessionid) throw new Error(`TikTok CH${ch.id}: cookies-এ sessionid/sid_tt পাওয়া যায়নি — fresh cookies দাও`);
 
-  // Step 1: Get upload URL from TikTok web
-  const initHeaders = {
-    ...headers,
-    'Content-Type': 'application/json',
-    'X-Requested-With': 'XMLHttpRequest',
-  };
+  const cookieStr = parseNetscapeCookies(ch.tk_cookies);
 
-  // Download file from Drive first
+  // Step 1: Drive থেকে file download করো (local path দরকার)
   let localPath = fileInfo.localPath;
+  let tempCreated = false;
   if (!localPath) {
-    const tmpPath = `/tmp/tk_${ch.id}_${Date.now()}.mp4`;
+    const tmpPath = path.join(TEMP_DIR, `tk_ck_${ch.id}_${Date.now()}.mp4`);
+    console.log(`  ⬇ [CookiesMode] Downloading from Drive...`);
     const dlR = await fetch(fileInfo.publicUrl);
-    if (!dlR.ok) throw new Error('Drive download failed');
+    if (!dlR.ok) throw new Error(`Drive download failed: HTTP ${dlR.status}`);
     const buf = await dlR.arrayBuffer();
     fs.writeFileSync(tmpPath, Buffer.from(buf));
     localPath = tmpPath;
+    tempCreated = true;
   }
 
-  const stat = fs.statSync(localPath);
-  const CHUNK_SIZE = 10 * 1024 * 1024;
-  const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
-  const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
+  try {
+    const stat = fs.statSync(localPath);
+    // TikTok chunk rules: 5MB-64MB per chunk
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+    const totalChunks = stat.size <= CHUNK_SIZE ? 1 : Math.floor(stat.size / CHUNK_SIZE);
+    const actualChunkSize = stat.size <= CHUNK_SIZE ? stat.size : CHUNK_SIZE;
 
-  // Init upload via web API
-  const initBody = JSON.stringify({
-    upload_type: 'INIT',
-    video_size: stat.size,
-    chunk_size: actualChunkSize,
-    total_chunk_count: totalChunks,
-  });
+    console.log(`  📤 [CookiesMode] file=${stat.size}b chunks=${totalChunks}`);
 
-  const initR = await fetch('https://www.tiktok.com/api/upload/media/?aid=1988&lang=en', {
-    method: 'POST',
-    headers: { ...initHeaders, 'Content-Length': String(initBody.length) },
-    body: initBody,
-  });
+    // Step 2: TikTok Creator API — FILE_UPLOAD init (cookie session দিয়ে)
+    // official endpoint কিন্তু Authorization header এর বদলে Cookie header use করছি
+    const postInfo = {
+      title: String(title).slice(0, 2200),
+      privacy_level: 'SELF_ONLY', // cookies mode এ safe default
+      disable_duet: !!ch.tk_disable_duet,
+      disable_stitch: !!ch.tk_disable_stitch,
+      disable_comment: !!ch.tk_disable_comment,
+      brand_content_toggle: false,
+      brand_organic_toggle: false,
+    };
 
-  const initD = await initR.json();
-  if (!initD.upload_url && !initD.data?.upload_url) throw new Error('TikTok cookies upload init failed: ' + JSON.stringify(initD));
-
-  const uploadUrl = initD.upload_url || initD.data?.upload_url;
-
-  // Upload chunks
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * actualChunkSize;
-    const end = Math.min(start + actualChunkSize, stat.size);
-    const chunk = fs.readFileSync(localPath).slice(start, end);
-    await fetch(uploadUrl, {
-      method: 'PUT',
+    const initR = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', {
+      method: 'POST',
       headers: {
-        ...headers,
-        'Content-Type': 'video/mp4',
-        'Content-Range': `bytes ${start}-${end-1}/${stat.size}`,
-        'Content-Length': String(end - start),
+        'Content-Type': 'application/json',
+        'Cookie': cookieStr,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
-      body: chunk,
+      body: JSON.stringify({
+        post_info: postInfo,
+        source_info: { source: 'FILE_UPLOAD', video_size: stat.size, chunk_size: actualChunkSize, total_chunk_count: totalChunks },
+      }),
     });
-    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+    const initD = await initR.json();
+
+    // official API ব্যর্থ হলে — TikTok web upload API fallback
+    if (initD.error && initD.error.code !== 'ok') {
+      console.log(`  ⚠ [CookiesMode] Official API failed (${initD.error.code}), trying web upload API...`);
+
+      // web API: session-based upload
+      const webInitBody = JSON.stringify({
+        upload_type: 'INIT',
+        video_size: stat.size,
+        chunk_size: actualChunkSize,
+        total_chunk_count: totalChunks,
+      });
+
+      const webInitR = await fetch('https://upload.tiktok.com/api/v1/upload/init/?aid=1988', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cookie': cookieStr,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://www.tiktok.com/upload/',
+          'Origin': 'https://www.tiktok.com',
+        },
+        body: webInitBody,
+      });
+
+      const webInitD = await webInitR.json();
+      if (!webInitD.upload_url && !webInitD.data?.upload_url) {
+        throw new Error(`TikTok cookies upload সম্পূর্ণ ব্যর্থ। Official API: ${JSON.stringify(initD.error)}. Web API: ${JSON.stringify(webInitD)}\n\n💡 সমাধান: TikTok-এ OAuth connect করো (🔑 Connect TikTok button)`);
+      }
+
+      const webUploadUrl = webInitD.upload_url || webInitD.data.upload_url;
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * actualChunkSize;
+        const end = Math.min(start + actualChunkSize, stat.size);
+        const chunk = fs.readFileSync(localPath).slice(start, end);
+        const putR = await fetch(webUploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'video/mp4',
+            'Content-Range': `bytes ${start}-${end-1}/${stat.size}`,
+            'Content-Length': String(end - start),
+            'Cookie': cookieStr,
+          },
+          body: chunk,
+        });
+        if (!putR.ok) throw new Error(`TikTok web PUT chunk ${i} failed: ${putR.status}`);
+        await new Promise(r => setTimeout(r, 200));
+      }
+      return `cookies_web_upload_done`;
+    }
+
+    // official API সফল — upload_url দিয়ে chunks upload করো
+    const uploadUrl = initD.data?.upload_url;
+    if (!uploadUrl) throw new Error('TikTok init: upload_url নেই — ' + JSON.stringify(initD));
+
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * actualChunkSize;
+      const end = Math.min(start + actualChunkSize, stat.size);
+      const chunkStream = fs.createReadStream(localPath, { start, end: end - 1 });
+      const chunkWeb = Readable.toWeb(chunkStream);
+      const putR = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'video/mp4', 'Content-Range': `bytes ${start}-${end-1}/${stat.size}` },
+        body: chunkWeb,
+        duplex: 'half',
+      });
+      if (!putR.ok) throw new Error(`TikTok PUT chunk ${i} failed: ${putR.status} ${await putR.text()}`);
+    }
+
+    return initD.data?.publish_id || 'cookies_official_upload_done';
+
+  } finally {
+    if (tempCreated && fs.existsSync(localPath)) { try { fs.unlinkSync(localPath); } catch {} }
   }
-
-  // Cleanup temp file
-  if (!fileInfo.localPath && fs.existsSync(localPath)) fs.unlinkSync(localPath);
-
-  return 'cookies_upload_done';
 }
 
 async function uploadToTikTok(cfg, ch, fileInfo, title, token) {
@@ -484,7 +550,7 @@ async function processChannel(platform, ch) {
   const description = ch.description?.trim() || '';
   let tags = [];
   if (ch.tags) { try { const parsed = typeof ch.tags === 'string' ? JSON.parse(ch.tags) : ch.tags; tags = Array.isArray(parsed) ? parsed : []; } catch { tags = String(ch.tags).split(',').map(t => t.trim()).filter(Boolean); } }
-  const needsLocal = (platform === 'youtube') || (platform === 'tiktok' && ch.tk_use_pull_from_url === false);
+  const needsLocal = (platform === 'youtube') || (platform === 'tiktok' && ch.tk_use_pull_from_url === false) || (platform === 'tiktok' && ch.tk_use_cookies && ch.tk_cookies);
   const fileInfo = { id: nextId, name: file.name, publicUrl: drivePublicUrl(nextId, apiKey), localPath: null };
   if (needsLocal) { console.log(`  ⬇ Downloading: ${file.name}`); await downloadDriveFile(nextId, tempPath, driveToken, apiKey); fileInfo.localPath = tempPath; }
   else console.log(`  🔗 Using Drive public URL`);
