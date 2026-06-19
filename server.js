@@ -7,9 +7,12 @@ const express   = require('express');
 const cors      = require('cors');
 const fs        = require('fs');
 const path      = require('path');
+const crypto    = require('crypto');
 const { Redis }    = require('@upstash/redis');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
+const { TelegramClient } = require('telegram');
+const { StringSession }  = require('telegram/sessions');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -51,12 +54,14 @@ function buildDefaultConfig() {
       base_url: process.env.BASE_URL || '',
       tg_bot_token: process.env.TG_BOT_TOKEN || '',
       tg_chat_id: process.env.TG_CHAT_ID || '',
+      tg_api_id: process.env.TG_API_ID || '',
+      tg_api_hash: process.env.TG_API_HASH || '',
     },
     channels: { youtube: [], tiktok: [], instagram: [], facebook: [] }
   };
 }
 function emptyChannel(platform, id) {
-  const base = { id, platform, name: `${platform} #${id}`, drive_folder_id: '', enabled: false, schedule: [], titles: [], description: '', tags: '' };
+  const base = { id, platform, name: `${platform} #${id}`, source_type: 'drive', drive_folder_id: '', tg_channel: '', tg_order: 'oldest', enabled: false, schedule: [], titles: [], description: '', tags: '' };
   if (platform === 'youtube')   return { ...base, yt_refresh_token: '' };
   if (platform === 'tiktok')    return { ...base, tk_access_token:'', tk_refresh_token:'', tk_open_id:'', tk_token_expires_at:0, tk_privacy:'', tk_use_pull_from_url:true, tk_disable_duet:false, tk_disable_stitch:false, tk_disable_comment:false, tk_cookies:'', tk_use_cookies:false };
   if (platform === 'instagram') return { ...base, ig_user_id:'', ig_access_token:'', ig_share_to_feed:true };
@@ -69,7 +74,10 @@ function normalizeChannel(platform, raw = {}, fallbackId = 1) {
   out.id = Number(raw.id) || fallbackId;
   out.platform = platform;
   out.name = String(raw.name || def.name);
+  out.source_type = raw.source_type === 'telegram' ? 'telegram' : 'drive';
   out.drive_folder_id = String(raw.drive_folder_id || '').trim();
+  out.tg_channel = String(raw.tg_channel || '').trim();
+  out.tg_order = raw.tg_order === 'newest' ? 'newest' : 'oldest';
   out.enabled = !!raw.enabled;
   out.schedule = normalizeScheduleSlots(raw.schedule);
   out.titles = normalizeTitlesList(raw.titles);
@@ -189,6 +197,102 @@ async function downloadDriveFile(fileId, destPath, driveToken, apiKey) {
 function drivePublicUrl(fileId, apiKey) {
   if (apiKey) return `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
   return `https://drive.google.com/uc?export=download&id=${fileId}`;
+}
+
+// =============== TELEGRAM SOURCE (MTProto via GramJS) ===============
+// Bot API দিয়ে 20MB+ ফাইল download করা যায় না — তাই raw MTProto দিয়ে bot login করছি।
+// একটাই bot (tg_bot_token) সব private channel-এ admin থাকবে, MTProto session Redis-এ persist হয়।
+const TG_SESSION_KEY = 'tg_mtproto_session_v1';
+let tgClient = null;
+let tgClientConnecting = null;
+let tgDialogsCache = null, tgDialogsCacheAt = 0;
+
+async function getTelegramClient(cfg) {
+  const apiId = parseInt(cfg.shared.tg_api_id, 10);
+  const apiHash = String(cfg.shared.tg_api_hash || '').trim();
+  const botToken = String(cfg.shared.tg_bot_token || '').trim();
+  if (!apiId || !apiHash) throw new Error('Telegram MTProto: Settings → Telegram-এ api_id/api_hash দাও (my.telegram.org থেকে)');
+  if (!botToken) throw new Error('Telegram MTProto: Bot Token দাও (Settings → Telegram)');
+  if (tgClient && tgClient.connected) return tgClient;
+  if (tgClientConnecting) return tgClientConnecting;
+  tgClientConnecting = (async () => {
+    let savedSession = '';
+    try { savedSession = (await redis.get(TG_SESSION_KEY)) || ''; } catch {}
+    const client = new TelegramClient(new StringSession(savedSession), apiId, apiHash, { connectionRetries: 5 });
+    await client.start({ botAuthToken: botToken });
+    const sessionStr = client.session.save();
+    if (sessionStr && sessionStr !== savedSession) { try { await redis.set(TG_SESSION_KEY, sessionStr); } catch {} }
+    tgClient = client;
+    return client;
+  })();
+  try { return await tgClientConnecting; } finally { tgClientConnecting = null; }
+}
+
+async function resolveTelegramEntity(client, identifier) {
+  const idStr = String(identifier || '').trim();
+  if (!idStr) throw new Error('Telegram channel ID/username দেওয়া হয়নি');
+  const looksNumeric = /^-?\d+$/.test(idStr);
+  try { return await client.getEntity(looksNumeric ? Number(idStr) : idStr.replace(/^@/, '')); }
+  catch (e) {
+    if (!tgDialogsCache || Date.now() - tgDialogsCacheAt > 5 * 60 * 1000) {
+      tgDialogsCache = await client.getDialogs({ limit: 300 });
+      tgDialogsCacheAt = Date.now();
+    }
+    const target = idStr.replace(/^-100/, '').replace(/^-/, '');
+    const found = tgDialogsCache.find(d => String(d.id).replace(/^-100/, '').replace(/^-/, '') === target);
+    if (found) return found.entity;
+    throw new Error(`Telegram channel "${idStr}" resolve করা যায়নি — bot কি ওই চ্যানেলে admin? (username দিলে @ ছাড়া লেখো)`);
+  }
+}
+
+async function listTelegramVideoMessages(client, entity, limit = 300) {
+  const messages = await client.getMessages(entity, { limit });
+  return messages
+    .filter(m => m && m.video)
+    .map(m => ({
+      id: m.id,
+      date: m.date ? (m.date instanceof Date ? m.date.getTime() : m.date * 1000) : 0,
+      caption: String(m.message || '').trim(),
+      fileName: (m.video.attributes || []).find(a => a.fileName)?.fileName || `tg_${m.id}.mp4`,
+      size: Number(m.video.size || 0),
+    }));
+}
+
+async function downloadTelegramVideoToFile(client, entity, messageId, destPath) {
+  const msgs = await client.getMessages(entity, { ids: [messageId] });
+  const msg = msgs && msgs[0];
+  if (!msg || !msg.video) throw new Error(`Telegram message ${messageId}: ভিডিও পাওয়া যায়নি (delete হয়ে গেছে?)`);
+  await client.downloadMedia(msg, { outputFile: destPath });
+  return destPath;
+}
+
+// Per-channel queue state — Drive-এর fixed "rotation" এর বদলে এখানে "processed_ids" রাখা হয়,
+// কারণ Telegram channel এ ক্রমাগত নতুন ভিডিও যুক্ত হতে থাকে (fixed list না)।
+function normalizeTelegramQueueState(raw = {}) {
+  let processed = Array.isArray(raw.processed_ids) ? raw.processed_ids.map(Number).filter(Number.isFinite) : [];
+  if (processed.length > 3000) processed = processed.slice(-3000); // অসীম বৃদ্ধি ঠেকাও
+  return { ...raw, processed_ids: processed, title_index: Number.isInteger(raw.title_index) ? raw.title_index : 0, last_message_id: raw.last_message_id || null, last_used_at: raw.last_used_at || null, usage_count: Number.isInteger(raw.usage_count) ? raw.usage_count : 0 };
+}
+function pickNextTelegramVideo(queueState, videos, order) {
+  const processedSet = new Set(queueState.processed_ids);
+  const candidates = videos.filter(v => !processedSet.has(v.id));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => order === 'newest' ? (b.id - a.id) : (a.id - b.id));
+  return candidates[0];
+}
+
+// =============== TEMP MEDIA SERVE (Telegram ভিডিও → Facebook/Instagram-কে সাময়িক public URL দেওয়ার জন্য) ===============
+// FB/IG সরাসরি ফাইল নেয় না, একটা fetchable URL চায়। Telegram প্রাইভেট ফাইলের কোনো public URL নেই,
+// তাই downloaded file টা আমাদের সার্ভার থেকেই অল্প সময়ের জন্য (token-based, একবার ব্যবহারযোগ্য) serve করছি।
+const tempServeMap = new Map(); // token -> { filePath, timer }
+function registerTempServe(filePath, ttlMs = 25 * 60 * 1000) {
+  const token = crypto.randomBytes(16).toString('hex');
+  const timer = setTimeout(() => {
+    tempServeMap.delete(token);
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  }, ttlMs);
+  tempServeMap.set(token, { filePath, timer });
+  return token;
 }
 
 // =============== UPLOADERS ===============
@@ -494,7 +598,7 @@ function driveDirectUrl(url) {
 async function uploadToInstagram(ch, fileInfo, caption) {
   if (!ch.ig_user_id) throw new Error(`IG CH${ch.id}: ig_user_id নেই`);
   if (!ch.ig_access_token) throw new Error(`IG CH${ch.id}: access_token নেই`);
-  if (!fileInfo.publicUrl) throw new Error(`IG CH${ch.id}: Drive public URL দরকার`);
+  if (!fileInfo.publicUrl) throw new Error(`IG CH${ch.id}: video URL দরকার (Drive public URL বা Telegram temp-serve URL)`);
   const params = new URLSearchParams({ media_type:'REELS', video_url: driveDirectUrl(fileInfo.publicUrl), caption: String(caption||'').slice(0,2200), share_to_feed: ch.ig_share_to_feed === false ? 'false':'true', access_token: ch.ig_access_token });
   const cR = await fetch(`https://graph.facebook.com/v22.0/${ch.ig_user_id}/media`, { method:'POST', body: params });
   const cD = await cR.json();
@@ -518,7 +622,7 @@ async function uploadToInstagram(ch, fileInfo, caption) {
 async function uploadToFacebook(ch, fileInfo, title, description) {
   if (!ch.fb_page_id) throw new Error(`FB CH${ch.id}: page_id নেই`);
   if (!ch.fb_page_access_token) throw new Error(`FB CH${ch.id}: page access_token নেই`);
-  if (!fileInfo.publicUrl) throw new Error(`FB CH${ch.id}: Drive public URL দরকার`);
+  if (!fileInfo.publicUrl) throw new Error(`FB CH${ch.id}: video URL দরকার (Drive public URL বা Telegram temp-serve URL)`);
   const r = await fetch(`https://graph.facebook.com/v22.0/${ch.fb_page_id}/videos`, { method:'POST', body: new URLSearchParams({ file_url: driveDirectUrl(fileInfo.publicUrl), title: String(title||'').slice(0,255), description: String(description||'').slice(0,5000), access_token: ch.fb_page_access_token }) });
   const d = await r.json();
   if (!d.id) throw new Error('FB upload failed: ' + JSON.stringify(d));
@@ -540,35 +644,72 @@ async function tg(msg, isError = false) {
 }
 
 // =============== CORE ===============
-async function processChannel(platform, ch) {
+async function processChannel(platform, ch, opts = {}) {
   const cfg = await loadConfig();
   console.log(`\n[${platform.toUpperCase()}] ${ch.name} (CH${ch.id})`);
-  if (!ch.drive_folder_id) throw new Error(`${platform} CH${ch.id}: Drive folder ID নেই`);
-  const apiKey = cfg.shared.drive_api_key || '';
-  let driveToken = null;
-  if (!apiKey) {
-    if (!cfg.shared.drive_refresh_token) throw new Error('Drive API Key বা OAuth token কোনোটাই নেই');
-    driveToken = await getDriveToken(cfg.shared);
-  }
-  const files = await listDriveFolder(ch.drive_folder_id, driveToken, apiKey);
-  if (!files.length) throw new Error('Drive folder-এ কোনো ভিডিও নেই');
-  const allIds = files.map(f => f.id);
-  const { nextId, chState } = await getNextFile(platform, ch.id, allIds);
-  if (!nextId) throw new Error('Queue empty');
-  const file = files.find(f => f.id === nextId);
   const tempPath = path.join(TEMP_DIR, `${platform}_ch${ch.id}_${Date.now()}.mp4`);
-  const titles = (ch.titles || []).filter(t => t && t.trim());
-  let title;
-  if (titles.length === 0) title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').trim() || ch.name;
-  else if (titles.length === 1) title = titles[0];
-  else { const ti = (chState.title_index || 0) % titles.length; title = titles[ti]; chState.title_index = ti + 1; }
+  let title, chState;
+  const fileInfo = { id: null, name: '', publicUrl: null, localPath: null };
+
+  if (ch.source_type === 'telegram') {
+    if (!ch.tg_channel) throw new Error(`${platform} CH${ch.id}: Telegram channel ID/username নেই`);
+    const client = await getTelegramClient(cfg);
+    const entity = await resolveTelegramEntity(client, ch.tg_channel);
+    const videos = await listTelegramVideoMessages(client, entity, 300);
+    if (!videos.length) throw new Error('Telegram channel-এ কোনো ভিডিও পাওয়া যায়নি');
+    chState = normalizeTelegramQueueState(await loadChannelState(platform, ch.id));
+    let target;
+    if (opts.forceTelegramMsgId) {
+      target = videos.find(v => v.id === Number(opts.forceTelegramMsgId));
+      if (!target) throw new Error(`Message ID ${opts.forceTelegramMsgId} খুঁজে পাওয়া যায়নি`);
+    } else {
+      target = pickNextTelegramVideo(chState, videos, ch.tg_order);
+      if (!target) throw new Error('Queue empty — এই Telegram channel-এর সব ভিডিও আগেই upload হয়ে গেছে');
+    }
+    const titles = (ch.titles || []).filter(t => t && t.trim());
+    if (titles.length === 0) title = target.caption || target.fileName.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').trim() || ch.name;
+    else if (titles.length === 1) title = titles[0];
+    else { const ti = (chState.title_index || 0) % titles.length; title = titles[ti]; chState.title_index = ti + 1; }
+    console.log(`  ⬇ Telegram থেকে downloading (msg ${target.id}): ${target.fileName}`);
+    await downloadTelegramVideoToFile(client, entity, target.id, tempPath);
+    fileInfo.id = target.id; fileInfo.name = target.fileName; fileInfo.localPath = tempPath;
+    if (platform === 'facebook' || platform === 'instagram') {
+      const base = cfg.shared.base_url || '';
+      if (!base) throw new Error(`Telegram→${platform}: Settings-এ Base URL দাও (temp video serve করার জন্য)`);
+      fileInfo.publicUrl = `${base.replace(/\/$/, '')}/tmp-media/${registerTempServe(tempPath)}`;
+      fileInfo._tempServe = true; // immediate cleanup স্কিপ হবে, token নিজেই পরে delete করবে
+    }
+    chState.processed_ids = [...new Set([...(chState.processed_ids || []), target.id])];
+    chState.last_message_id = target.id; chState.last_used_at = new Date().toISOString(); chState.usage_count = (chState.usage_count || 0) + 1;
+  } else {
+    // ---- Drive source ----
+    if (!ch.drive_folder_id) throw new Error(`${platform} CH${ch.id}: Drive folder ID নেই`);
+    const apiKey = cfg.shared.drive_api_key || '';
+    let driveToken = null;
+    if (!apiKey) {
+      if (!cfg.shared.drive_refresh_token) throw new Error('Drive API Key বা OAuth token কোনোটাই নেই');
+      driveToken = await getDriveToken(cfg.shared);
+    }
+    const files = await listDriveFolder(ch.drive_folder_id, driveToken, apiKey);
+    if (!files.length) throw new Error('Drive folder-এ কোনো ভিডিও নেই');
+    const allIds = files.map(f => f.id);
+    const next = await getNextFile(platform, ch.id, allIds);
+    if (!next.nextId) throw new Error('Queue empty');
+    chState = next.chState;
+    const file = files.find(f => f.id === next.nextId);
+    const titles = (ch.titles || []).filter(t => t && t.trim());
+    if (titles.length === 0) title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').trim() || ch.name;
+    else if (titles.length === 1) title = titles[0];
+    else { const ti = (chState.title_index || 0) % titles.length; title = titles[ti]; chState.title_index = ti + 1; }
+    const needsLocal = (platform === 'youtube') || (platform === 'tiktok' && ch.tk_use_pull_from_url === false);
+    fileInfo.id = next.nextId; fileInfo.name = file.name; fileInfo.publicUrl = drivePublicUrl(next.nextId, apiKey);
+    if (needsLocal) { console.log(`  ⬇ Downloading: ${file.name}`); await downloadDriveFile(next.nextId, tempPath, driveToken, apiKey); fileInfo.localPath = tempPath; }
+    else console.log(`  🔗 Using Drive public URL`);
+  }
+
   const description = ch.description?.trim() || '';
   let tags = [];
   if (ch.tags) { try { const parsed = typeof ch.tags === 'string' ? JSON.parse(ch.tags) : ch.tags; tags = Array.isArray(parsed) ? parsed : []; } catch { tags = String(ch.tags).split(',').map(t => t.trim()).filter(Boolean); } }
-  const needsLocal = (platform === 'youtube') || (platform === 'tiktok' && ch.tk_use_pull_from_url === false);
-  const fileInfo = { id: nextId, name: file.name, publicUrl: drivePublicUrl(nextId, apiKey), localPath: null };
-  if (needsLocal) { console.log(`  ⬇ Downloading: ${file.name}`); await downloadDriveFile(nextId, tempPath, driveToken, apiKey); fileInfo.localPath = tempPath; }
-  else console.log(`  🔗 Using Drive public URL`);
 
   let resultId, resultUrl;
   try {
@@ -593,13 +734,16 @@ async function processChannel(platform, ch) {
       resultId = await uploadToFacebook(ch, fileInfo, title, description);
       resultUrl = `https://www.facebook.com/${ch.fb_page_id}/videos/${resultId}`;
     } else throw new Error('Unknown platform: ' + platform);
-  } finally { if (fileInfo.localPath) { try { fs.unlinkSync(fileInfo.localPath); } catch {} } }
+  } finally {
+    // Telegram→FB/IG হলে file এখনই delete করি না — registerTempServe()-এর timer পরে cleanup করবে
+    if (fileInfo.localPath && !fileInfo._tempServe) { try { fs.unlinkSync(fileInfo.localPath); } catch {} }
+  }
   await saveChannelState(platform, ch.id, chState);
-  await addLog({ platform, chId: ch.id, channel: ch.name, title, videoId: resultId, url: resultUrl, file: file.name, status: 'ok' });
+  await addLog({ platform, chId: ch.id, channel: ch.name, title, videoId: resultId, url: resultUrl, file: fileInfo.name, status: 'ok' });
   // FIX BUG3: title ও channel name escape করো Telegram markdown injection রোধে
-  await tg(`Platform: *${platform}*\nChannel: *${escapeMarkdown(ch.name)}*\nTitle: \`${escapeMarkdown(title)}\`\nLink: ${resultUrl}\nFile: \`${escapeMarkdown(file.name)}\``);
+  await tg(`Platform: *${platform}*\nChannel: *${escapeMarkdown(ch.name)}*\nTitle: \`${escapeMarkdown(title)}\`\nLink: ${resultUrl}\nFile: \`${escapeMarkdown(fileInfo.name)}\``);
   console.log(`  🎉 Done! ${resultUrl}`);
-  return { resultId, resultUrl, title, file: file.name };
+  return { resultId, resultUrl, title, file: fileInfo.name };
 }
 
 // =============== JOBS ===============
@@ -629,7 +773,7 @@ const channelJobs = {};
 async function runUploadJob(targets) {
   const jobId = newJob();
   const cfg = await loadConfig();
-  const promises = targets.map(async ({ platform, chId }) => {
+  const promises = targets.map(async ({ platform, chId, forceTelegramMsgId }) => {
     const ch = findChannel(cfg, platform, chId);
     const key = `${platform}:${chId}`;
     if (!ch || !ch.enabled) { jobLog(jobId, `⏭ ${key} disabled/notfound`); return { platform, chId, status:'skip' }; }
@@ -652,7 +796,7 @@ async function runUploadJob(targets) {
           } else {
             jobLog(jobId, `▶ ${key} (${ch.name}) শুরু...`);
           }
-          const r = await processChannel(platform, ch);
+          const r = await processChannel(platform, ch, { forceTelegramMsgId });
           jobLog(jobId, `✅ ${key} সফল: ${r.resultUrl}`);
           if (jobs[jobId]) jobs[jobId].ok++;
           return { platform, chId, status:'ok', ...r };
@@ -909,7 +1053,7 @@ app.get('/auth/instagram/:chId/callback', async (req, res) => {
 function maskSensitive(safe) {
   const mask = v => v ? '••••' + String(v).slice(-4) : '';
   const s = safe.shared;
-  ['yt_client_secret','drive_client_secret','drive_refresh_token','tg_bot_token','tv_client_secret','tiktok_client_secret','fb_app_secret','drive_api_key'].forEach(k => { if (s[k]) s[k] = mask(s[k]); });
+  ['yt_client_secret','drive_client_secret','drive_refresh_token','tg_bot_token','tv_client_secret','tiktok_client_secret','fb_app_secret','drive_api_key','tg_api_hash'].forEach(k => { if (s[k]) s[k] = mask(s[k]); });
   for (const p of PLATFORMS) (safe.channels[p] || []).forEach(ch => {
     if (ch.yt_refresh_token) ch.yt_refresh_token = '••••connected';
     if (ch.tk_refresh_token) ch.tk_refresh_token = '••••connected';
@@ -949,13 +1093,15 @@ app.post('/api/channel/:platform/:chId', async (req, res) => {
   const ch = findChannel(cfg, platform, chId);
   if (!ch) return res.status(404).json({ error:'Channel not found' });
   const body = req.body || {};
-  const writable = ['name','drive_folder_id','enabled','schedule','titles','description','tags','yt_refresh_token','tk_refresh_token','tk_access_token','tk_open_id','tk_privacy','tk_use_pull_from_url','tk_disable_duet','tk_disable_stitch','tk_disable_comment','ig_user_id','ig_access_token','ig_share_to_feed','fb_page_id','fb_page_access_token'];
+  const writable = ['name','source_type','drive_folder_id','tg_channel','tg_order','enabled','schedule','titles','description','tags','yt_refresh_token','tk_refresh_token','tk_access_token','tk_open_id','tk_privacy','tk_use_pull_from_url','tk_disable_duet','tk_disable_stitch','tk_disable_comment','ig_user_id','ig_access_token','ig_share_to_feed','fb_page_id','fb_page_access_token'];
   for (const k of writable) {
     if (body[k] === undefined) continue;
     if (typeof body[k] === 'string' && body[k].includes('••••')) continue;
     if (k === 'schedule') { ch[k] = normalizeScheduleSlots(body[k]); continue; }
     if (k === 'titles') { ch[k] = normalizeTitlesList(body[k]); continue; }
     if (k === 'tags') { ch[k] = Array.isArray(body[k]) ? body[k] : String(body[k] || ''); continue; }
+    if (k === 'source_type') { ch[k] = body[k] === 'telegram' ? 'telegram' : 'drive'; continue; }
+    if (k === 'tg_order') { ch[k] = body[k] === 'newest' ? 'newest' : 'oldest'; continue; }
     ch[k] = body[k];
   }
   await saveConfig(cfg);
@@ -985,6 +1131,38 @@ app.get('/api/job/:id', (req, res) => {
 app.get('/api/logs', async (req, res) => { const raw = await redis.lrange('upload_log_v2', 0, 299); res.json(raw.map(r => typeof r === 'string' ? JSON.parse(r) : r)); });
 app.post('/api/state/reset/:platform/:chId', async (req, res) => { await redis.del(`state:${req.params.platform}:${req.params.chId}`); res.json({ ok:true }); });
 app.post('/api/telegram/test', async (req, res) => { try { await tg('✅ Telegram connected! YT7 v12 চালু আছে 🎉'); res.json({ ok:true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// ---- Telegram MTProto source endpoints ----
+app.post('/api/telegram/mtproto/test', async (req, res) => {
+  try {
+    const cfg = await loadConfig();
+    const client = await getTelegramClient(cfg);
+    const me = await client.getMe();
+    res.json({ ok:true, bot: me.username ? '@' + me.username : (me.firstName || 'connected') });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/telegram/:platform/:chId/preview', async (req, res) => {
+  try {
+    const platform = req.params.platform; const chId = parseInt(req.params.chId);
+    if (!PLATFORMS.includes(platform)) return res.status(400).json({ error:'Invalid platform' });
+    const cfg = await loadConfig();
+    const ch = findChannel(cfg, platform, chId);
+    if (!ch) return res.status(404).json({ error:'Channel not found' });
+    if (ch.source_type !== 'telegram' || !ch.tg_channel) return res.status(400).json({ error:'এই channel-এ Telegram source সেট করা নেই' });
+    const client = await getTelegramClient(cfg);
+    const entity = await resolveTelegramEntity(client, ch.tg_channel);
+    const videos = await listTelegramVideoMessages(client, entity, 300);
+    const state = normalizeTelegramQueueState(await loadChannelState(platform, chId));
+    const processedSet = new Set(state.processed_ids);
+    const sorted = [...videos].sort((a, b) => ch.tg_order === 'newest' ? b.id - a.id : a.id - b.id);
+    res.json({ ok:true, order: ch.tg_order, items: sorted.map(v => ({ id:v.id, caption:v.caption, date:v.date, size:v.size, fileName:v.fileName, processed: processedSet.has(v.id) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/telegram/:platform/:chId/upload/:msgId', async (req, res) => {
+  const platform = req.params.platform; const chId = parseInt(req.params.chId); const msgId = parseInt(req.params.msgId);
+  if (!PLATFORMS.includes(platform)) return res.status(400).json({ error:'Invalid platform' });
+  res.json({ jobId: await runUploadJob([{ platform, chId, forceTelegramMsgId: msgId }]) });
+});
 
 // FIX BUG2: redis.mget 100 key limit — চ্যানেল বেশি হলে crash হতো
 // এখন 100 key-এর batch-এ ভাগ করে mget করা হয়
@@ -1022,7 +1200,9 @@ app.get('/api/status', async (req, res) => {
       const st = allStates[keyIdx++] || {};
       const rotation = Array.isArray(st.rotation) ? st.rotation : [];
       const hasToken = p==='youtube'?!!ch.yt_refresh_token : p==='tiktok'?(!!ch.tk_refresh_token||!!ch.tk_cookies) : p==='instagram'?!!ch.ig_access_token : p==='facebook'?!!ch.fb_page_access_token : false;
-      return { id: ch.id, name: ch.name, enabled: ch.enabled, hasToken, hasDrive: !!ch.drive_folder_id, schedule: ch.schedule, queueLeft: rotation.length, totalDone: Number.isInteger(st.usage_count) ? st.usage_count : 0 };
+      const isTg = ch.source_type === 'telegram';
+      const hasSource = isTg ? !!ch.tg_channel : !!ch.drive_folder_id;
+      return { id: ch.id, name: ch.name, enabled: ch.enabled, hasToken, hasSource, sourceType: ch.source_type || 'drive', schedule: ch.schedule, queueLeft: isTg ? null : rotation.length, totalDone: Number.isInteger(st.usage_count) ? st.usage_count : 0 };
     });
   }
   const todayBD = bdDateOffset(0);
@@ -1049,14 +1229,33 @@ app.get('/api/time', async (req, res) => {
   res.json({ bd: `${current} (${date})`, utc: new Date().toISOString(), next_upload: next ? `[${next.platform}] ${next.ch} @ ${next.slot} (${next.diff}m পরে)` : 'কোনো schedule নেই' });
 });
 
-app.get('/version', (req, res) => res.json({ version:'v12.4', build:'bugfixed-r2', platforms: PLATFORMS, fixes: ['job-error-status','scheduler-cache','status-mget','ig-timeout','tiktok-error-detect','tiktok-token-race','fb-api-v22','channeljobs-race','mget-batching','tg-markdown-escape','tiktok-error-consistency'] }));
+app.get('/version', (req, res) => res.json({ version:'v13.0', build:'telegram-source', platforms: PLATFORMS, features: ['telegram-mtproto-source','drive-source','queue-newest-oldest-order','manual-pick-upload'], fixes: ['job-error-status','scheduler-cache','status-mget','ig-timeout','tiktok-error-detect','tiktok-token-race','fb-api-v22','channeljobs-race','mget-batching','tg-markdown-escape','tiktok-error-consistency'] }));
+
+app.get('/tmp-media/:token', (req, res) => {
+  const entry = tempServeMap.get(req.params.token);
+  if (!entry || !fs.existsSync(entry.filePath)) return res.status(404).end();
+  const stat = fs.statSync(entry.filePath);
+  const range = req.headers.range;
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  if (range) {
+    const m = /bytes=(\d+)-(\d+)?/.exec(range);
+    const start = m ? parseInt(m[1], 10) : 0;
+    const end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+    res.writeHead(206, { 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 });
+    fs.createReadStream(entry.filePath, { start, end }).pipe(res);
+  } else {
+    res.setHeader('Content-Length', stat.size);
+    fs.createReadStream(entry.filePath).pipe(res);
+  }
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`🚀 YT7 Multi-Uploader v12.4 (bugfixed-r2) on port ${PORT}`);
+    console.log(`🚀 YT7 Multi-Uploader v13.0 (telegram-source) on port ${PORT}`);
     startScheduler();
   });
 } else {
