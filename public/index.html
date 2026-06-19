@@ -157,8 +157,14 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#38bdf8}
     <h2>📨 Telegram</h2>
     <div class="form-row">
       <div class="form-group"><label>Bot Token</label><input id="s-tg-token" type="password"></div>
-      <div class="form-group"><label>Chat ID</label><input id="s-tg-chat"></div>
+      <div class="form-group"><label>Chat ID (notification)</label><input id="s-tg-chat"></div>
     </div>
+    <p style="color:#64748b;font-size:.78rem;margin:10px 0 8px">নিচের দুটো MTProto-এর জন্য লাগবে (Telegram source ব্যবহার করতে চাইলে) — <a href="https://my.telegram.org" target="_blank" style="color:#7dd3fc">my.telegram.org</a> থেকে নাও।</p>
+    <div class="form-row">
+      <div class="form-group"><label>API ID</label><input id="s-tg-apiid" placeholder="1234567"></div>
+      <div class="form-group"><label>API Hash</label><input id="s-tg-apihash" type="password"></div>
+    </div>
+    <button class="btn btn-outline btn-sm" onclick="testMTProto()" style="margin-top:6px">🔌 Test MTProto Connection</button>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap">
     <button class="btn btn-primary" onclick="saveShared()">💾 Save Settings</button>
@@ -249,9 +255,9 @@ function renderDashboard(){
     list.forEach(ch => {
       grid.innerHTML += `<div class="ch-card ${ch.enabled?'active':'inactive'}">
         <div class="ch-header"><span class="ch-name">${escapeHtml(ch.name)}</span><span class="badge ${ch.enabled?'badge-on':'badge-off'}">${ch.enabled?'ON':'OFF'}</span></div>
-        <div class="ch-stat">🔑 ${ch.hasToken?'✅':'❌'} | 📁 ${ch.hasDrive?'✅':'❌'}</div>
+        <div class="ch-stat">🔑 ${ch.hasToken?'✅':'❌'} | ${ch.sourceType==='telegram'?'📨':'📁'} ${ch.hasSource?'✅':'❌'}</div>
         <div class="ch-stat">⏰ ${ch.schedule?.join(', ')||'নেই'}</div>
-        <div class="ch-stat">📊 Queue: ${ch.queueLeft} | Done: ${ch.totalDone}</div>
+        <div class="ch-stat">📊 Queue: ${ch.queueLeft==null?'-':ch.queueLeft} | Done: ${ch.totalDone}</div>
         <div class="ch-actions">
           <button class="btn btn-primary btn-xs" onclick="triggerChannel('${p}',${ch.id})">▶ Upload</button>
           <button class="btn btn-outline btn-xs" onclick="resetState('${p}',${ch.id})">🔄 Reset</button>
@@ -284,10 +290,24 @@ function renderChannelCard(p, ch){
     </div>
     <div class="form-row">
       <div class="form-group"><label>Channel Name</label><input id="${id}-name" value="${escapeHtml(ch.name)}"></div>
-      <div class="form-group"><label>Drive Folder ID</label><input id="${id}-folder" value="${escapeHtml(ch.drive_folder_id||'')}" placeholder="ফোল্ডার URL এর শেষ অংশ"></div>
+      <div class="form-group"><label>Video Source</label><select id="${id}-source" onchange="toggleSourceFields('${id}')">
+        <option value="drive" ${ch.source_type!=='telegram'?'selected':''}>📁 Google Drive</option>
+        <option value="telegram" ${ch.source_type==='telegram'?'selected':''}>📨 Telegram Channel</option>
+      </select></div>
     </div>
+    <div id="${id}-src-drive" class="form-group" style="margin-bottom:10px;${ch.source_type==='telegram'?'display:none':''}">
+      <label>Drive Folder ID</label><input id="${id}-folder" value="${escapeHtml(ch.drive_folder_id||'')}" placeholder="ফোল্ডার URL এর শেষ অংশ">
+    </div>
+    <div id="${id}-src-telegram" class="form-row" style="margin-bottom:10px;${ch.source_type==='telegram'?'':'display:none'}">
+      <div class="form-group"><label>Telegram Channel (ID/username)</label><input id="${id}-tgchannel" value="${escapeHtml(ch.tg_channel||'')}" placeholder="-1001234567890 বা channelusername"></div>
+      <div class="form-group"><label>Order</label><select id="${id}-tgorder">
+        <option value="oldest" ${ch.tg_order!=='newest'?'selected':''}>পুরাতন থেকে নতুন (FIFO)</option>
+        <option value="newest" ${ch.tg_order==='newest'?'selected':''}>নতুন থেকে পুরাতন</option>
+      </select></div>
+    </div>
+    ${ch.source_type==='telegram' ? `<div style="margin-bottom:10px"><button class="btn btn-outline btn-xs" onclick="previewTelegramQueue('${p}',${ch.id})">📋 Queue Preview / নির্দিষ্ট ভিডিও Upload</button><div id="${id}-tgpreview"></div></div>` : ''}
     ${renderPlatformFields(p, ch, id)}
-    <div class="form-group" style="margin-bottom:10px"><label>📝 Titles (প্রতি লাইনে ১টা)</label><textarea id="${id}-titles" rows="5" placeholder="খালি রাখলে Drive filename ব্যবহার হবে">${escapeHtml((ch.titles||[]).join('\n'))}</textarea></div>
+    <div class="form-group" style="margin-bottom:10px"><label>📝 Titles (প্রতি লাইনে ১টা)</label><textarea id="${id}-titles" rows="5" placeholder="খালি রাখলে Drive filename / Telegram caption ব্যবহার হবে">${escapeHtml((ch.titles||[]).join('\n'))}</textarea></div>
     <div class="form-group" style="margin-bottom:10px"><label>📄 Description</label><textarea id="${id}-desc" rows="2">${escapeHtml(ch.description||'')}</textarea></div>
     <div class="form-group" style="margin-bottom:10px"><label>🏷️ Tags (JSON array অথবা comma-separated)</label><textarea id="${id}-tags" rows="2" style="font-family:monospace;font-size:.8rem">${escapeHtml(typeof ch.tags==='string'?ch.tags:(ch.tags?JSON.stringify(ch.tags):''))}</textarea></div>
     <div style="margin-bottom:12px">
@@ -490,15 +510,18 @@ function renderSharedSettings(){
   g('s-base').value = s.base_url || '';
   g('s-tg-token').value = s.tg_bot_token || '';
   g('s-tg-chat').value = s.tg_chat_id || '';
+  g('s-tg-apiid').value = s.tg_api_id || '';
+  g('s-tg-apihash').value = s.tg_api_hash || '';
 }
 
 async function saveShared(){
   const g = id => document.getElementById(id).value;
-  const body = { drive_api_key: g('s-drive-apikey'), drive_client_id: g('s-d-cid'), drive_client_secret: g('s-d-cs'), drive_refresh_token: g('s-d-rt'), yt_client_id: g('s-yt-cid'), yt_client_secret: g('s-yt-cs'), tv_client_id: g('s-tv-cid'), tv_client_secret: g('s-tv-cs'), yt_privacy: g('s-privacy'), tiktok_client_key: g('s-tk-ck'), tiktok_client_secret: g('s-tk-cs'), tiktok_privacy: g('s-tk-privacy'), fb_app_id: g('s-fb-appid'), fb_app_secret: g('s-fb-appsecret'), base_url: g('s-base'), tg_bot_token: g('s-tg-token'), tg_chat_id: g('s-tg-chat') };
+  const body = { drive_api_key: g('s-drive-apikey'), drive_client_id: g('s-d-cid'), drive_client_secret: g('s-d-cs'), drive_refresh_token: g('s-d-rt'), yt_client_id: g('s-yt-cid'), yt_client_secret: g('s-yt-cs'), tv_client_id: g('s-tv-cid'), tv_client_secret: g('s-tv-cs'), yt_privacy: g('s-privacy'), tiktok_client_key: g('s-tk-ck'), tiktok_client_secret: g('s-tk-cs'), tiktok_privacy: g('s-tk-privacy'), fb_app_id: g('s-fb-appid'), fb_app_secret: g('s-fb-appsecret'), base_url: g('s-base'), tg_bot_token: g('s-tg-token'), tg_chat_id: g('s-tg-chat'), tg_api_id: g('s-tg-apiid'), tg_api_hash: g('s-tg-apihash') };
   const r = await api('POST','/api/config/shared', body);
   r.ok ? toast('✅ Saved') : toast('❌ Error', false);
 }
 async function testTG(){ const r = await api('POST','/api/telegram/test'); r.ok ? toast('✅ Telegram সফল') : toast('❌ '+(r.error||'failed'), false); }
+async function testMTProto(){ toast('⏳ Connecting...'); const r = await api('POST','/api/telegram/mtproto/test'); r.ok ? toast('✅ MTProto connected: '+r.bot) : toast('❌ '+(r.error||'failed'), false); }
 
 async function addChannel(p){ const r = await api('POST','/api/channel/'+p+'/add'); if (!r.ok) return toast('❌ Failed', false); toast('✅ '+PLATFORM_META[p].label+' added'); loadAll(); }
 async function deleteChannel(p, id){
@@ -518,6 +541,39 @@ function addSlot(id){
   document.getElementById(id+'-slots').appendChild(div); inp.value='';
 }
 
+function toggleSourceFields(id){
+  const v = document.getElementById(id+'-source').value;
+  const dEl = document.getElementById(id+'-src-drive'), tEl = document.getElementById(id+'-src-telegram');
+  if (dEl) dEl.style.display = v==='drive' ? '' : 'none';
+  if (tEl) tEl.style.display = v==='telegram' ? '' : 'none';
+}
+
+async function previewTelegramQueue(p, chId){
+  const id = p+'-'+chId;
+  const box = document.getElementById(id+'-tgpreview');
+  if (!box) return;
+  box.innerHTML = '<p style="color:#94a3b8;font-size:.8rem;margin-top:8px">⏳ লোড হচ্ছে...</p>';
+  const r = await api('GET', '/api/telegram/'+p+'/'+chId+'/preview');
+  if (r.error) { box.innerHTML = '<p style="color:#fca5a5;font-size:.8rem;margin-top:8px">❌ '+escapeHtml(r.error)+'</p>'; return; }
+  if (!r.items || !r.items.length) { box.innerHTML = '<p style="color:#64748b;font-size:.8rem;margin-top:8px">কোনো ভিডিও পাওয়া যায়নি</p>'; return; }
+  box.innerHTML = '<div style="margin-top:8px;max-height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:6px">' +
+    r.items.slice(0,30).map(v => `<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div style="font-size:.78rem;${v.processed?'color:#64748b':'color:#e2e8f0'}">
+        ${v.processed?'✅ ':''}<b>#${v.id}</b> ${escapeHtml(v.caption || v.fileName || '')}
+        <div style="color:#64748b;font-size:.7rem">${v.date ? new Date(v.date).toLocaleString() : ''}</div>
+      </div>
+      ${v.processed ? '<span style="font-size:.72rem;color:#64748b;flex-shrink:0">Uploaded</span>' : '<button class="btn btn-success btn-xs" style="flex-shrink:0" onclick="forceUploadTelegram(\''+p+'\','+chId+','+v.id+')">▶ Upload</button>'}
+    </div>`).join('') + '</div>';
+}
+
+async function forceUploadTelegram(p, chId, msgId){
+  if (!confirm('Message #'+msgId+' এখনই upload করব?')) return;
+  const box=document.getElementById('jobStatus'); box.style.display='block'; box.textContent='⏳ শুরু...';
+  const r = await api('POST', '/api/telegram/'+p+'/'+chId+'/upload/'+msgId);
+  if (!r.jobId) { box.textContent='❌ '+(r.error||'Failed'); return; }
+  pollJob(r.jobId);
+}
+
 async function saveChannel(p, id){
   const idStr = p+'-'+id;
   // FIX: সঠিকভাবে element ID build করে value নেওয়া
@@ -532,7 +588,10 @@ async function saveChannel(p, id){
   if (tags && !tags.startsWith('[')) tags = JSON.stringify(tags.split(',').map(t=>t.trim()).filter(Boolean));
   const body = {
     name: gv('-name'),
+    source_type: gv('-source') || 'drive',
     drive_folder_id: gv('-folder'),
+    tg_channel: gv('-tgchannel'),
+    tg_order: gv('-tgorder') || 'oldest',
     schedule: Array.from(new Set(slots)).sort(),
     titles: (gv('-titles')||'').split(/\r?\n/).map(t=>t.trim()).filter(Boolean),
     description: gv('-desc'),
