@@ -11,8 +11,9 @@ const crypto    = require('crypto');
 const { Redis }    = require('@upstash/redis');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
-const { TelegramClient } = require('telegram');
+const { TelegramClient, Api } = require('telegram');
 const { StringSession }  = require('telegram/sessions');
+const { computeCheck }   = require('telegram/Password');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -200,32 +201,63 @@ function drivePublicUrl(fileId, apiKey) {
 }
 
 // =============== TELEGRAM SOURCE (MTProto via GramJS) ===============
-// Bot API দিয়ে 20MB+ ফাইল download করা যায় না — তাই raw MTProto দিয়ে bot login করছি।
-// একটাই bot (tg_bot_token) সব private channel-এ admin থাকবে, MTProto session Redis-এ persist হয়।
+// Bot API দিয়ে 20MB+ ফাইল download করা যায় না, আর bot দিয়ে channel history (GetHistory) ব্রাউজও করা যায় না (BOT_METHOD_INVALID)।
+// তাই raw MTProto-তে একটা real account (phone login) ব্যবহার করছি — সেই account-টা source channel-এর member হলেই চলবে। Session Redis-এ persist হয়।
 const TG_SESSION_KEY = 'tg_mtproto_session_v1';
 let tgClient = null;
 let tgClientConnecting = null;
 let tgDialogsCache = null, tgDialogsCacheAt = 0;
+let pendingTgLogin = null; // { client, phoneNumber, phoneCodeHash } — login flow-এর মধ্যবর্তী state
 
 async function getTelegramClient(cfg) {
   const apiId = parseInt(cfg.shared.tg_api_id, 10);
   const apiHash = String(cfg.shared.tg_api_hash || '').trim();
-  const botToken = String(cfg.shared.tg_bot_token || '').trim();
   if (!apiId || !apiHash) throw new Error('Telegram MTProto: Settings → Telegram-এ api_id/api_hash দাও (my.telegram.org থেকে)');
-  if (!botToken) throw new Error('Telegram MTProto: Bot Token দাও (Settings → Telegram)');
   if (tgClient && tgClient.connected) return tgClient;
   if (tgClientConnecting) return tgClientConnecting;
   tgClientConnecting = (async () => {
-    let savedSession = '';
-    try { savedSession = (await redis.get(TG_SESSION_KEY)) || ''; } catch {}
+    const savedSession = (await redis.get(TG_SESSION_KEY)) || '';
+    if (!savedSession) throw new Error('Telegram account login করা হয়নি — Settings → Telegram-এ phone number দিয়ে login করো');
     const client = new TelegramClient(new StringSession(savedSession), apiId, apiHash, { connectionRetries: 5 });
-    await client.start({ botAuthToken: botToken });
-    const sessionStr = client.session.save();
-    if (sessionStr && sessionStr !== savedSession) { try { await redis.set(TG_SESSION_KEY, sessionStr); } catch {} }
+    await client.connect();
+    if (!(await client.isUserAuthorized())) throw new Error('Telegram session expired — আবার login করো (Settings → Telegram)');
     tgClient = client;
     return client;
   })();
   try { return await tgClientConnecting; } finally { tgClientConnecting = null; }
+}
+
+// ধাপ ১: phone number-এ login code পাঠাও
+async function startTelegramLogin(cfg, phoneNumber) {
+  const apiId = parseInt(cfg.shared.tg_api_id, 10);
+  const apiHash = String(cfg.shared.tg_api_hash || '').trim();
+  if (!apiId || !apiHash) throw new Error('আগে Settings-এ api_id/api_hash দাও');
+  if (!phoneNumber) throw new Error('Phone number দাও (যেমন +8801XXXXXXXXX)');
+  const client = new TelegramClient(new StringSession(''), apiId, apiHash, { connectionRetries: 5 });
+  await client.connect();
+  const sent = await client.sendCode({ apiId, apiHash }, phoneNumber);
+  pendingTgLogin = { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash };
+}
+
+// ধাপ ২: code (এবং থাকলে 2FA password) দিয়ে login সম্পূর্ণ করো
+async function verifyTelegramLogin(code, password) {
+  if (!pendingTgLogin) throw new Error('আগে phone number দিয়ে code পাঠাও');
+  const { client, phoneNumber, phoneCodeHash } = pendingTgLogin;
+  try {
+    await client.invoke(new Api.auth.SignIn({ phoneNumber, phoneCodeHash, phoneCode: code }));
+  } catch (e) {
+    if (String(e.message || '').includes('SESSION_PASSWORD_NEEDED')) {
+      if (!password) throw new Error('এই account-এ 2FA password চালু আছে — password দিয়ে আবার Verify করো');
+      const passwordInfo = await client.invoke(new Api.account.GetPassword());
+      const check = await computeCheck(passwordInfo, password);
+      await client.invoke(new Api.auth.CheckPassword({ password: check }));
+    } else throw e;
+  }
+  const sessionStr = client.session.save();
+  await redis.set(TG_SESSION_KEY, sessionStr);
+  if (tgClient) { try { tgClient.destroy(); } catch {} }
+  tgClient = client;
+  pendingTgLogin = null;
 }
 
 async function resolveTelegramEntity(client, identifier) {
@@ -241,7 +273,7 @@ async function resolveTelegramEntity(client, identifier) {
     const target = idStr.replace(/^-100/, '').replace(/^-/, '');
     const found = tgDialogsCache.find(d => String(d.id).replace(/^-100/, '').replace(/^-/, '') === target);
     if (found) return found.entity;
-    throw new Error(`Telegram channel "${idStr}" resolve করা যায়নি — bot কি ওই চ্যানেলে admin? (username দিলে @ ছাড়া লেখো)`);
+    throw new Error(`Telegram channel "${idStr}" resolve করা যায়নি — login করা account কি ওই চ্যানেলের member? (username দিলে @ ছাড়া লেখো)`);
   }
 }
 
@@ -1139,6 +1171,28 @@ app.post('/api/telegram/mtproto/test', async (req, res) => {
     const client = await getTelegramClient(cfg);
     const me = await client.getMe();
     res.json({ ok:true, bot: me.username ? '@' + me.username : (me.firstName || 'connected') });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/telegram/mtproto/status', async (req, res) => {
+  try { const s = await redis.get(TG_SESSION_KEY); res.json({ loggedIn: !!s }); }
+  catch (e) { res.json({ loggedIn: false }); }
+});
+app.post('/api/telegram/mtproto/login/start', async (req, res) => {
+  try {
+    const phone = String(req.body.phone || '').trim();
+    if (!phone) return res.status(400).json({ error: 'Phone number দাও (যেমন +8801XXXXXXXXX)' });
+    const cfg = await loadConfig();
+    await startTelegramLogin(cfg, phone);
+    res.json({ ok:true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/telegram/mtproto/login/verify', async (req, res) => {
+  try {
+    const code = String(req.body.code || '').trim();
+    const password = String(req.body.password || '');
+    if (!code) return res.status(400).json({ error: 'Code দাও' });
+    await verifyTelegramLogin(code, password);
+    res.json({ ok:true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/telegram/:platform/:chId/preview', async (req, res) => {
