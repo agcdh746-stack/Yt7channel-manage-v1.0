@@ -156,15 +156,30 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#38bdf8}
   <div class="card">
     <h2>📨 Telegram</h2>
     <div class="form-row">
-      <div class="form-group"><label>Bot Token</label><input id="s-tg-token" type="password"></div>
+      <div class="form-group"><label>Bot Token (শুধু notification-এর জন্য)</label><input id="s-tg-token" type="password"></div>
       <div class="form-group"><label>Chat ID (notification)</label><input id="s-tg-chat"></div>
     </div>
-    <p style="color:#64748b;font-size:.78rem;margin:10px 0 8px">নিচের দুটো MTProto-এর জন্য লাগবে (Telegram source ব্যবহার করতে চাইলে) — <a href="https://my.telegram.org" target="_blank" style="color:#7dd3fc">my.telegram.org</a> থেকে নাও।</p>
+    <p style="color:#64748b;font-size:.78rem;margin:10px 0 8px">নিচের দুটো video-source MTProto-এর জন্য — <a href="https://my.telegram.org" target="_blank" style="color:#7dd3fc">my.telegram.org</a> থেকে নাও।</p>
     <div class="form-row">
       <div class="form-group"><label>API ID</label><input id="s-tg-apiid" placeholder="1234567"></div>
       <div class="form-group"><label>API Hash</label><input id="s-tg-apihash" type="password"></div>
     </div>
-    <button class="btn btn-outline btn-sm" onclick="testMTProto()" style="margin-top:6px">🔌 Test MTProto Connection</button>
+    <div style="background:#1e3a5f;border-radius:8px;padding:12px;margin-top:10px">
+      <p style="color:#7dd3fc;font-size:.82rem;margin-bottom:8px">📱 Account Login (video source পড়ার জন্য) — bot দিয়ে private channel history পড়া যায় না, তাই একটা account দিয়ে login করতে হবে। এই account-টা যেই private channel থেকে ভিডিও নিতে চাও সেখানে member থাকতে হবে (admin লাগবে না)।</p>
+      <div id="tg-login-status" style="font-size:.8rem;margin-bottom:10px;color:#94a3b8">⏳ Status check হচ্ছে...</div>
+      <div id="tg-login-step1">
+        <div class="form-group" style="margin-bottom:8px"><label>Phone Number</label><input id="tg-phone" placeholder="+8801XXXXXXXXX"></div>
+        <button class="btn btn-primary btn-sm" onclick="tgLoginSendCode()">📤 Code পাঠাও</button>
+      </div>
+      <div id="tg-login-step2" style="display:none;margin-top:10px">
+        <div class="form-row">
+          <div class="form-group"><label>Code (Telegram app/SMS-এ পাবে)</label><input id="tg-code"></div>
+          <div class="form-group"><label>2FA Password (যদি থাকে)</label><input id="tg-password" type="password"></div>
+        </div>
+        <button class="btn btn-success btn-sm" onclick="tgLoginVerify()">✅ Login সম্পূর্ণ করো</button>
+      </div>
+    </div>
+    <button class="btn btn-outline btn-sm" onclick="testMTProto()" style="margin-top:10px">🔌 Test MTProto Connection</button>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap">
     <button class="btn btn-primary" onclick="saveShared()">💾 Save Settings</button>
@@ -512,6 +527,7 @@ function renderSharedSettings(){
   g('s-tg-chat').value = s.tg_chat_id || '';
   g('s-tg-apiid').value = s.tg_api_id || '';
   g('s-tg-apihash').value = s.tg_api_hash || '';
+  checkTgLoginStatus();
 }
 
 async function saveShared(){
@@ -522,6 +538,33 @@ async function saveShared(){
 }
 async function testTG(){ const r = await api('POST','/api/telegram/test'); r.ok ? toast('✅ Telegram সফল') : toast('❌ '+(r.error||'failed'), false); }
 async function testMTProto(){ toast('⏳ Connecting...'); const r = await api('POST','/api/telegram/mtproto/test'); r.ok ? toast('✅ MTProto connected: '+r.bot) : toast('❌ '+(r.error||'failed'), false); }
+
+async function checkTgLoginStatus(){
+  const r = await api('GET', '/api/telegram/mtproto/status');
+  const el = document.getElementById('tg-login-status');
+  if (!el) return;
+  el.textContent = r.loggedIn ? '✅ Account login করা আছে' : '❌ Login করা নেই — নিচে phone number দিয়ে login করো';
+  el.style.color = r.loggedIn ? '#86efac' : '#fca5a5';
+}
+async function tgLoginSendCode(){
+  const phone = document.getElementById('tg-phone').value.trim();
+  if (!phone) return toast('📱 Phone number দাও', false);
+  toast('⏳ Code পাঠানো হচ্ছে...');
+  const r = await api('POST', '/api/telegram/mtproto/login/start', { phone });
+  if (!r.ok) return toast('❌ '+(r.error||'failed'), false);
+  toast('✅ Code পাঠানো হয়েছে — Telegram app/SMS চেক করো');
+  document.getElementById('tg-login-step2').style.display = 'block';
+}
+async function tgLoginVerify(){
+  const code = document.getElementById('tg-code').value.trim();
+  const password = document.getElementById('tg-password').value;
+  if (!code) return toast('Code দাও', false);
+  toast('⏳ Verifying...');
+  const r = await api('POST', '/api/telegram/mtproto/login/verify', { code, password });
+  if (!r.ok) return toast('❌ '+(r.error||'failed'), false);
+  toast('✅ Login সফল!');
+  checkTgLoginStatus();
+}
 
 async function addChannel(p){ const r = await api('POST','/api/channel/'+p+'/add'); if (!r.ok) return toast('❌ Failed', false); toast('✅ '+PLATFORM_META[p].label+' added'); loadAll(); }
 async function deleteChannel(p, id){
